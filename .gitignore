@@ -1,0 +1,12 @@
+__pycache__
+*.pyc
+.venv
+*.log
+*.bak
+*.swap
+*.swp
+*.txt
+result
+output
+crawler/model
+/venv
