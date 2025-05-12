@@ -116,19 +116,15 @@ class TradingTask(Base):
 
 # --- 数据库会话管理和初始化 ---
 # FastAPI 依赖注入函数，用于在请求处理函数中获取数据库会话
-async def get_db() -> AsyncSession:  # 类型提示返回 AsyncSession
+async def get_db():
     """
     FastAPI 依赖项，提供一个数据库会话。
-    在请求开始时获取会话，在请求结束时自动提交或回滚，并关闭会话。
+    事务的提交和回滚由调用此依赖的端点函数负责。
     """
-    async with AsyncSessionLocal() as session:  # 从会话工厂获取一个会话
+    async with AsyncSessionLocal() as session:
         try:
             yield session  # 将会话提供给请求处理函数
-            await session.commit()  # 如果处理函数中没有错误，则提交事务
-        except Exception as e:
-            logger.error(f"数据库事务执行期间发生错误，正在回滚: {e}", exc_info=True)
-            await session.rollback()  # 如果发生任何异常，则回滚事务
-            raise  # 重新抛出异常，以便 FastAPI 能捕获并处理
+            # 注意：移除了这里的 await session.commit() 和 await session.rollback()
         finally:
             await session.close()  # 确保会话最终被关闭
 

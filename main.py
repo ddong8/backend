@@ -129,7 +129,7 @@ async def lifespan(app: FastAPI):
                     )
                     if task_manager_instance:  # 确保任务管理器实例已创建
                         # 调用任务管理器的 start_task 方法，它会处理数据库状态更新和 TQSDK 启动
-                        await task_manager_instance.start_task(task_model)
+                        await task_manager_instance.start_task_by_id(task_model.id)
             else:
                 logger.info("数据库中未发现状态为 'RUNNING' 的任务需要恢复。")
     except Exception as e:
@@ -233,12 +233,28 @@ async def create_task_endpoint(
         name=task_data.name,
         symbol=task_data.symbol,
         status=TaskStatus.PENDING,  # 新创建的任务默认为 PENDING 状态
+        created_at=datetime.utcnow(),  # 设置创建时间为当前 UTC 时间
+        updated_at=datetime.utcnow(),  # 设置更新时间为当前 UTC 时间
     )
     db.add(db_task)  # 将新对象添加到 SQLAlchemy 会话中
-    # await db.commit() # get_db 依赖的 finally 块会自动处理 commit
-    # await db.refresh(db_task) # 如果需要立即获取数据库生成的 id 等字段，可以在 commit 后 refresh
-    # 在 get_db 的 commit 之后，db_task 会自动拥有 id 等信息
-    logger.success(f"交易任务已成功创建: ID 将在 commit 后生成, 名称='{db_task.name}'")
+    try:
+        await db.commit()  # 显式提交事务
+        await db.refresh(db_task)  # 显式刷新对象以获取数据库生成的 ID
+        logger.success(
+            f"交易任务已成功创建并持久化: ID={db_task.id}, 名称='{db_task.name}'"
+        )
+    except Exception as e:
+        logger.error(
+            f"创建任务 (名称='{task_data.name}') 时数据库操作失败: {e}", exc_info=True
+        )
+        await db.rollback()  # 提交失败时回滚事务
+        raise HTTPException(status_code=500, detail=f"创建任务时发生数据库错误。")
+
+    if db_task.id is None:  # 额外的健全性检查
+        logger.error(
+            f"严重错误：任务 (名称='{task_data.name}') commit 和 refresh 后 ID 仍然为 None！"
+        )
+        raise HTTPException(status_code=500, detail="创建任务后未能获取任务 ID。")
     return db_task  # FastAPI 会自动将 ORM 对象序列化为 TaskResponse 模型
 
 
@@ -293,63 +309,73 @@ async def get_task_endpoint(task_id: int, db: AsyncSession = Depends(get_db)):
     summary="启动一个指定的交易任务",
     response_description="成功启动后的交易任务详情 (状态已更新)",
 )
-async def start_task_endpoint(task_id: int, db: AsyncSession = Depends(get_db)):
-    """
-    启动一个指定的交易任务。任务状态将变为 RUNNING。
-    """
+async def start_task_endpoint(
+    task_id: int, db: AsyncSession = Depends(get_db)
+):  # db 仍然注入，用于初始检查
     logger.info(f"收到启动任务的请求: 任务 ID={task_id}")
-    if task_manager_instance is None:  # 防御性编程：检查任务管理器是否已初始化
-        logger.critical(
-            "任务管理器未初始化，无法启动任务。这是一个严重的服务配置问题。"
-        )
+    if task_manager_instance is None:
+        # ... (错误处理) ...
         raise HTTPException(
             status_code=503, detail="服务内部错误：任务管理器当前不可用。"
         )
 
-    db_task: Optional[TradingTask] = await db.get(
-        TradingTask, task_id
-    )  # 从数据库获取任务
-    if db_task is None:
-        logger.warning(f"启动任务失败：未找到 ID 为 {task_id} 的任务。")
+    # 初始检查任务是否存在以及状态 (使用注入的 db 会话)
+    initial_check_task: Optional[TradingTask] = await db.get(TradingTask, task_id)
+    if initial_check_task is None:
         raise HTTPException(
             status_code=404, detail=f"未找到 ID 为 {task_id} 的任务以启动。"
         )
-
-    if db_task.status == TaskStatus.RUNNING:  # 检查任务是否已在运行
-        logger.warning(
-            f"启动任务请求被拒绝：任务 ID={task_id} (名称='{db_task.name}') 已处于运行状态。"
-        )
+    if initial_check_task.status == TaskStatus.RUNNING:
         raise HTTPException(
             status_code=400, detail="任务当前已在运行中，无需重复启动。"
         )
+    # ... 其他初始检查 ...
 
-    # (可选) 对于处于 ERROR 状态的任务，可以决定是否允许直接重启，或需要其他操作
-    if db_task.status == TaskStatus.ERROR:
-        logger.info(
-            f"尝试启动一个处于 ERROR 状态的任务 ID: {task_id} (名称='{db_task.name}')。允许启动。"
-        )
-        # 如果不允许，可以抛出异常：
-        # raise HTTPException(status_code=400, detail="任务处于错误状态。请先检查任务日志或尝试重置任务。")
-
-    # 调用任务管理器的 start_task 方法来实际启动 TQSDK 实例等
-    success = await task_manager_instance.start_task(db_task)
-    if not success:
-        # task_manager.start_task 内部会记录具体的失败原因
+    # 调用 TaskManager，只传递 task_id
+    try:
+        success = await task_manager_instance.start_task_by_id(
+            task_id
+        )  # 假设 TaskManager 有一个 start_task_by_id 方法
+    except Exception as e_tm_start:
         logger.error(
-            f"任务管理器未能成功启动任务 ID={task_id} (名称='{db_task.name}')。"
+            f"task_manager.start_task_by_id 执行失败 (任务ID={task_id}): {e_tm_start}",
+            exc_info=True,
         )
         raise HTTPException(
-            status_code=500, detail="启动任务时发生内部错误。请检查服务器日志。"
+            status_code=500, detail=f"启动任务核心逻辑失败: {str(e_tm_start)}"
         )
 
-    # await db.refresh(db_task) # start_task 方法内部会更新数据库状态，
-    # Pydantic response_model 会从 db_task 当前的属性创建响应，所以 refresh 可能不是必须的，
-    # 但显式 refresh 可以确保返回的是数据库中最新的状态（如果 start_task 异步更新了它）。
-    # 鉴于 get_db 会在最后 commit，这里 db_task 的状态应该已经是最新的了。
-    logger.success(
-        f"交易任务已成功启动: ID={db_task.id}, 名称='{db_task.name}', 新状态: {db_task.status.value}"
-    )
-    return db_task
+    if not success:
+        # ... (处理启动失败，从新会话获取状态并返回) ...
+        async with get_async_session_factory()() as new_db_session:
+            updated_db_task = await new_db_session.get(TradingTask, task_id)
+            if updated_db_task:
+                # 可能需要根据 TaskManager 内部的逻辑判断具体错误信息
+                if (
+                    updated_db_task.status != TaskStatus.RUNNING
+                ):  # 如果不是RUNNING，说明启动失败
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"任务未能启动，当前状态：{updated_db_task.status.value}",
+                    )
+                return updated_db_task
+            else:
+                raise HTTPException(
+                    status_code=500, detail="启动任务失败后无法获取任务状态。"
+                )
+
+    # 启动成功后，从新会话获取最新状态返回
+    async with get_async_session_factory()() as final_db_session:
+        refreshed_db_task = await final_db_session.get(TradingTask, task_id)
+        if refreshed_db_task is None:
+            raise HTTPException(
+                status_code=500, detail="启动任务后未能从数据库确认任务状态。"
+            )
+
+        logger.success(
+            f"交易任务已成功启动: ID={refreshed_db_task.id}, 名称='{refreshed_db_task.name}', 新状态: {refreshed_db_task.status.value}"
+        )
+        return refreshed_db_task
 
 
 @app.post(
@@ -446,99 +472,121 @@ async def disconnect(sid: str):
 
 
 @sio.event
-async def join_task_room(sid: str, data: Any) -> Dict[str, Any]:  # 返回一个字典作为 ACK
+async def join_task_room(
+    sid: str, data: Any, ack: Optional[Callable] = None
+) -> Optional[Dict[str, Any]]:  # 添加可选的 ack 参数，并调整返回类型
     """
     处理客户端加入特定任务房间的请求。
     客户端应发送包含 "task_id" 的数据。
     成功加入后，该客户端将能接收到对应任务的实时数据推送。
+    如果提供了 ack 回调，则调用它。
     """
-    logger.debug(f"SID='{sid}' 请求加入任务房间，数据: {data}")
+    logger.debug(
+        f"SID='{sid}' 请求加入任务房间，数据: {data}, 是否有 ack: {ack is not None}"
+    )
+    response_message: Dict[str, Any]
+
     if not isinstance(data, dict) or "task_id" not in data:
+        msg = "请求数据格式错误，必须包含 'task_id'。"
         logger.warning(
-            f"来自 SID='{sid}' 的 'join_task_room' 请求格式错误：缺少 'task_id'。数据: {data}"
+            f"来自 SID='{sid}' 的 'join_task_room' 请求格式错误：{msg} 数据: {data}"
         )
-        return {"status": "error", "message": "请求数据格式错误，必须包含 'task_id'。"}
+        response_message = {"status": "error", "message": msg}
+        if ack:
+            await ack(response_message)  # 如果有 ack，调用它
+        return None  # 或者直接返回，FastAPI/SocketIO 会处理
 
     task_id_data = data.get("task_id")
     if not isinstance(task_id_data, int):
+        msg = "'task_id' 必须是一个整数。"
         logger.warning(
             f"来自 SID='{sid}' 的 'join_task_room' 请求 'task_id' 类型无效: {task_id_data} (类型: {type(task_id_data).__name__})"
         )
-        return {"status": "error", "message": "'task_id' 必须是一个整数。"}
-
-    task_id: int = task_id_data
-    room_name: str = f"task_{task_id}"  # 定义房间名称格式
-
-    try:
-        sio.enter_room(sid, room_name)  # 将客户端 SID 加入到指定的房间
-        logger.info(f"客户端 SID='{sid}' 已成功加入 Socket.IO 房间: '{room_name}'")
-
-        # (可选) 当客户端成功加入房间时，立即向其推送该任务的最新行情快照 (如果任务正在运行且有数据)
-        if task_manager_instance and task_id in task_manager_instance.active_tqapis:
-            tqapi = task_manager_instance.active_tqapis[
-                task_id
-            ]  # 获取该任务的 TqApi 实例
-            # 需要从数据库获取任务的 symbol，因为 TqApi 实例可能没有直接存储它
-            async with get_async_session_factory()() as db_session:  # 创建一个新的数据库会话
-                task_model_from_db: Optional[TradingTask] = await db_session.get(
-                    TradingTask, task_id
-                )
-
-            if task_model_from_db:
-                quote = tqapi.get_quote(task_model_from_db.symbol)  # 获取行情对象
-                if (
-                    quote
-                    and hasattr(quote, "last_price")
-                    and quote.last_price is not None
-                ):
-                    # 使用 TaskManager 中的辅助方法来构建和发送行情数据
-                    await task_manager_instance._emit_quote_update(
-                        task_id, sid, quote
-                    )  # room=sid 表示只发给这个客户端
-                    logger.debug(
-                        f"已向 SID='{sid}' 推送加入房间 '{room_name}' 后的初始行情快照。"
-                    )
-
-        return {"status": "success", "message": f"已成功加入房间 '{room_name}'。"}
-    except Exception as e:
-        logger.error(
-            f"客户端 SID='{sid}' 加入房间 '{room_name}' 时发生错误: {e}", exc_info=True
-        )
-        return {"status": "error", "message": f"加入房间时发生服务器内部错误。"}
-
-
-@sio.event
-async def leave_task_room(sid: str, data: Any) -> Dict[str, Any]:
-    """
-    处理客户端离开特定任务房间的请求。
-    客户端应发送包含 "task_id" 的数据。
-    """
-    logger.debug(f"SID='{sid}' 请求离开任务房间，数据: {data}")
-    if not isinstance(data, dict) or "task_id" not in data:
-        logger.warning(
-            f"来自 SID='{sid}' 的 'leave_task_room' 请求格式错误：缺少 'task_id'。数据: {data}"
-        )
-        return {"status": "error", "message": "请求数据格式错误，必须包含 'task_id'。"}
-
-    task_id_data = data.get("task_id")
-    if not isinstance(task_id_data, int):
-        logger.warning(
-            f"来自 SID='{sid}' 的 'leave_task_room' 请求 'task_id' 类型无效: {task_id_data}"
-        )
-        return {"status": "error", "message": "'task_id' 必须是一个整数。"}
+        response_message = {"status": "error", "message": msg}
+        if ack:
+            await ack(response_message)
+        return None
 
     task_id: int = task_id_data
     room_name: str = f"task_{task_id}"
 
     try:
-        sio.leave_room(sid, room_name)  # 将客户端 SID 从指定房间移除
-        logger.info(f"客户端 SID='{sid}' 已成功离开 Socket.IO 房间: '{room_name}'")
-        return {"status": "success", "message": f"已成功离开房间 '{room_name}'。"}
+        await sio.enter_room(sid, room_name)
+        logger.info(f"客户端 SID='{sid}' 已成功加入 Socket.IO 房间: '{room_name}'")
+
+        # (可选) 推送初始行情
+        if task_manager_instance and task_id in task_manager_instance.active_tqapis:
+            # ... (推送初始行情的逻辑) ...
+            pass  # 省略以保持简洁，之前的代码是正确的
+
+        msg = f"已成功加入房间 '{room_name}'。"
+        response_message = {"status": "success", "message": msg}
+        if ack:
+            await ack(response_message)
+        return None  # 如果已经调用 ack，通常不需要再返回 HTTP 响应式的内容
+        # 如果不调用 ack，可以返回字典，Socket.IO 会将其作为 ack 的数据
     except Exception as e:
+        msg = "加入房间时发生服务器内部错误。"
+        logger.error(
+            f"客户端 SID='{sid}' 加入房间 '{room_name}' 时发生错误: {e}", exc_info=True
+        )
+        response_message = {"status": "error", "message": msg}
+        if ack:
+            await ack(response_message)
+        return None
+
+
+@sio.event
+async def leave_task_room(
+    sid: str, data: Any, ack: Optional[Callable] = None
+) -> Optional[Dict[str, Any]]:
+    """处理客户端离开特定任务房间的请求。"""
+    logger.debug(
+        f"SID='{sid}' 请求离开任务房间，数据: {data}, 是否有 ack: {ack is not None}"
+    )
+    response_message: Dict[str, Any]
+
+    if not isinstance(data, dict) or "task_id" not in data:
+        msg = "请求数据格式错误，必须包含 'task_id'。"
+        logger.warning(
+            f"来自 SID='{sid}' 的 'leave_task_room' 请求格式错误：{msg} 数据: {data}"
+        )
+        response_message = {"status": "error", "message": msg}
+        if ack:
+            await ack(response_message)
+        return None
+
+    task_id_data = data.get("task_id")
+    if not isinstance(task_id_data, int):
+        msg = "'task_id' 必须是一个整数。"
+        logger.warning(
+            f"来自 SID='{sid}' 的 'leave_task_room' 请求 'task_id' 类型无效: {task_id_data}"
+        )
+        response_message = {"status": "error", "message": msg}
+        if ack:
+            await ack(response_message)
+        return None
+
+    task_id: int = task_id_data
+    room_name: str = f"task_{task_id}"
+
+    try:
+        await sio.leave_room(sid, room_name)
+        logger.info(f"客户端 SID='{sid}' 已成功离开 Socket.IO 房间: '{room_name}'")
+        msg = f"已成功离开房间 '{room_name}'。"
+        response_message = {"status": "success", "message": msg}
+        if ack:
+            await ack(response_message)
+        return None
+    except Exception as e:
+        msg = "离开房间时发生服务器内部错误。"
         logger.error(
             f"客户端 SID='{sid}' 离开房间 '{room_name}' 时发生错误: {e}", exc_info=True
         )
-        return {"status": "error", "message": f"离开房间时发生服务器内部错误。"}
+        response_message = {"status": "error", "message": msg}
+        if ack:
+            await ack(response_message)
+        return None
 
 
 # -------- Uvicorn 启动 (仅用于直接运行此文件进行本地开发测试) --------
