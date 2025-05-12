@@ -38,10 +38,12 @@ Base = declarative_base(metadata=metadata_obj)
 # 创建异步数据库引擎实例
 async_engine = create_async_engine(
     DATABASE_URL,  # 使用从配置中获取的数据库连接字符串
-    echo=False,  # 在生产环境中通常设置为 False，以避免打印过多的 SQL 日志
-    # 开发时可以设为 True 来调试 SQL 语句
-    pool_size=10,  # 连接池中保持的最小连接数
-    max_overflow=20,  # 连接池在达到 pool_size 后允许创建的额外连接数
+    echo=False, 
+    pool_size=10,
+    max_overflow=20,
+    pool_timeout=30,
+    pool_recycle=1800,    # 例如 30 分钟回收一次
+    pool_pre_ping=True    # ***** 启用 pre-ping *****
 )
 
 # 创建异步数据库会话的工厂 (factory)
