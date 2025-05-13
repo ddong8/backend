@@ -44,79 +44,80 @@ class TaskManager:
 
             except Exception as get_obj_err:
                 logger.error(f"[任务 {task_id}] 获取 TQSDK 对象时发生错误: {get_obj_err}", exc_info=True)
-                if "验证失败" in str(get_obj_err) or "auth failed" in str(get_obj_err).lower():
-                    await self.sio.emit("task_error", {"task_id": task_id, "error": f"TQSDK认证失败: {str(get_obj_err)[:100]}"}, room=room_name)
+                # ... (错误上报 emit) ...
                 raise 
 
-            # 初始数据推送 (此时数据对象已获取)
+            # 初始数据推送
             if quote and hasattr(quote, 'last_price') and quote.last_price is not None:
                 await self._emit_quote_update(task_id, room_name, quote, tqapi_instance)
-            if account_info: # 即使初始时 account_info 的字段可能为空，也推送一次结构
+            if account_info:
                  await self._emit_account_update(task_id, room_name, account_info)
 
-            logger.info(f"[任务 {task_id}] 进入 TQSDK 更新监听循环 (使用 register_update_notify)...")
+            logger.info(f"[任务 {task_id}] 进入 TQSDK 更新监听循环 (使用 register_update_notify 和 is_changing)...")
             
-            # register_update_notify() 不传入参数时，会监控所有已通过 get_quote/get_order 等获取的对象
-            # 或者只传入你最关心的对象，例如 quote
+            # register_update_notify() 不传入参数会监控所有已 get 的对象，
+            # 或者传入你希望其更新能“唤醒” update_chan 的主要对象。
+            # 对于账户信息这种可能独立于行情更新的对象，我们会在每次循环迭代后都用 is_changing 检查。
             async with tqapi_instance.register_update_notify() as update_chan: 
-            # 或者 async with tqapi_instance.register_update_notify(quote) as update_chan:
                 while task_id in self.active_asyncio_tasks:
                     try:
-                        # 当 update_chan.recv() 返回时，意味着 TQSDK 内部数据已更新
-                        # 我们不需要再调用 is_updated()，直接读取对象的属性即可
-                        has_update = await asyncio.wait_for(update_chan.recv(), timeout=1.0) 
+                        # 等待 TQSDK 通知有数据更新，或者超时
+                        # async for _ in update_chan: 这种写法是正确的，
+                        # 它等同于在循环中调用 await update_chan.recv() 并检查其返回值。
+                        # 如果想加入超时，需要改写成 wait_for(update_chan.recv(), timeout)
                         
-                        if not has_update: # recv() 返回 False 的处理
+                        # 改为使用 wait_for 来明确处理超时
+                        try:
+                            await asyncio.wait_for(update_chan.recv(), timeout=1.0)
+                            # 当 recv() 返回时（无论True/False），表示 TQSDK 完成了一轮数据处理
+                            logger.trace(f"[任务 {task_id}] update_chan 收到信号或超时后唤醒。")
+                        except asyncio.TimeoutError:
                             if task_id not in self.active_asyncio_tasks:
-                                logger.info(f"[任务 {task_id}] update_chan.recv() 返回 False 且任务已被外部标记停止。")
-                                break 
-                            logger.debug(f"[任务 {task_id}] update_chan.recv() 返回 False，但任务仍活动。检查 TQSDK 在线状态。")
-                            if tqapi_instance and not tqapi_instance.is_online(): 
-                                logger.warning(f"[任务 {task_id}] TQSDK 已离线，等待其自动重连机制...")
-                                await asyncio.sleep(1) 
-                            continue
+                                logger.info(f"[任务 {task_id}] 等待TQSDK更新超时后，检测到停止信号。")
+                                break
+                            # 超时是正常的，表示在1秒内 channel 没有收到“主要”更新信号
+                            # 但我们仍然需要检查对象是否发生了变化
+                            # logger.trace(f"[任务 {task_id}] 等待TQSDK更新超时，继续检查对象变化...")
+                            pass # 继续执行下面的 is_changing 检查
                         
-                        # ***** 核心修正：移除所有 is_updated() 调用 *****
-                        # 当 recv() 返回 True (即 has_update 为 True)，表示有数据更新
-                        # 直接推送 quote 和 account_info 的当前状态
-                        logger.trace(f"[任务 {task_id}] TQSDK 数据更新，推送行情和账户信息。")
-                        await self._emit_quote_update(task_id, room_name, quote, tqapi_instance)
-                        if account_info: # 确保 account_info 存在
+                        if task_id not in self.active_asyncio_tasks: # 再次检查停止信号
+                            logger.info(f"[任务 {task_id}] 检测到停止信号，退出监听循环。")
+                            break
+
+                        # ***** 使用 is_changing() 判断特定对象是否更新 *****
+                        if tqapi_instance.is_changing(quote): # 检查 quote 对象是否有任何字段发生变化
+                        # if tqapi_instance.is_changing(quote, "last_price"): # 或者检查特定字段
+                            logger.trace(f"[任务 {task_id}] quote 对象已更新。")
+                            await self._emit_quote_update(task_id, room_name, quote, tqapi_instance)
+                        
+                        if account_info and tqapi_instance.is_changing(account_info): # 检查账户信息是否有变化
+                            logger.trace(f"[任务 {task_id}] account_info 对象已更新。")
                             await self._emit_account_update(task_id, room_name, account_info)
+                        
+                        # （可选）检查其他你关心的对象，例如订单、持仓等
+                        # orders = tqapi_instance.get_orders() # 假设你获取了订单列表
+                        # for order_id, order in orders.items():
+                        #     if tqapi_instance.is_changing(order):
+                        #         logger.info(f"[任务 {task_id}] 订单 {order_id} 已更新: {order}")
+                        #         # ... 推送订单更新 ...
 
-                    except asyncio.TimeoutError: # wait_for 超时
-                        if task_id not in self.active_asyncio_tasks:
-                            logger.info(f"[任务 {task_id}] 在等待更新超时后，检测到外部停止信号。")
-                            break 
-                        # 超时意味着在 1.0 秒内，我们订阅的对象 (通过 register_update_notify) 没有发生 TQSDK 认为的“更新”
-                        # 但这并不意味着其他未显式订阅的对象（如此处的 account_info）没有变化。
-                        # TQSDK 的推荐做法是，如果关心 account_info，也应将其加入 register_update_notify
-                        # 但由于 account_info 不可哈希，我们不能直接加入。
-                        # 所以，超时后，我们仍然可以尝试推送一下 account_info (如果它有变化)
-                        # TQSDK 内部的 is_updated 应该指的是 Account 对象本身是否有字段被更新，
-                        # 而不是 TqApi 实例的方法。但我们已决定不使用它。
-                        # 替代方案：如果 account_info 可能在没有 quote 更新时独立更新，
-                        # 那么可能需要更频繁地（例如，即使超时也）推送 account_info，
-                        # 或者找到 TQSDK 中监控 Account 对象变化的正确方式（如果 register_update_notify 不直接支持）。
-                        # 为了简化，我们这里可以假设如果行情没更新，账户信息更新的概率也低，
-                        # 或者依赖于下一次行情更新时一起推送。
-                        # 或者，如果 TQSDK 的 Account 对象是响应式的，直接推送它的当前值也是可以的，
-                        # 前提是其内部状态已经被 TQSDK 的某个后台机制更新了。
-
-                        # logger.trace(f"[任务 {task_id}] 等待TQSDK更新超时，继续...")
-                        continue # 继续等待下一次更新
-                    
-                    except TqTimeoutError: 
+                    except TqTimeoutError: # TQSDK 内部的超时
                         logger.warning(f"[任务 {task_id}] TQSDK 内部操作超时。")
                         if tqapi_instance and not tqapi_instance.is_online():
                             logger.error(f"[任务 {task_id}] TQSDK 在操作超时后检测为离线。")
+                        # 即使 TqTimeoutError，也可能需要检查对象状态
+                        if tqapi_instance and quote and tqapi_instance.is_changing(quote):
+                            await self._emit_quote_update(task_id, room_name, quote, tqapi_instance)
+                        if tqapi_instance and account_info and tqapi_instance.is_changing(account_info):
+                            await self._emit_account_update(task_id, room_name, account_info)
                         continue
                     
                     except Exception as loop_err: 
+                        # ... (错误处理逻辑与上一版本相同) ...
                         err_msg = str(loop_err)
                         logger.error(f"[任务 {task_id}] TQSDK 监听循环中发生错误: {err_msg}", exc_info=True)
                         error_occurred_flag = True
-                        # ... (错误上报逻辑不变) ...
+                        # ... (emit task_error) ...
                         if "行情服务用户验证失败" in err_msg or "登录失败" in err_msg or "密码错误" in err_msg or "auth fail" in err_msg.lower():
                             await self.sio.emit("task_error", {"task_id": task_id, "error": f"TQSDK认证/连接问题: {err_msg[:150]}"}, room=room_name)
                         elif isinstance(loop_err, ConnectionError):
@@ -127,27 +128,27 @@ class TaskManager:
                         if "行情服务用户验证失败" in err_msg or "再连接失败" in err_msg :
                             logger.error(f"[任务 {task_id}] 遭遇严重TQSDK错误，将停止此任务的监听循环。")
                             break 
-                        continue
+                        continue # 对于其他可恢复的错误，尝试继续
                     
-                    await asyncio.sleep(0.005) # 避免过于密集的CPU占用 (如果循环迭代非常快)
+                    await asyncio.sleep(0.005) # 避免CPU空转，如果循环非常快且无更新
             logger.info(f"[任务 {task_id}] 已退出 TQSDK 更新监听循环。")
 
         except asyncio.CancelledError:
             logger.info(f"[任务 {task_id}] TQSDK 运行器任务已被取消。")
         except Exception as e: 
+            # ... (启动或初始化时的错误处理逻辑与上一版本相同) ...
             err_msg = str(e)
             logger.error(f"[任务 {task_id}] TQSDK 运行器启动或初始化时发生错误 (标的: {symbol}): {err_msg}", exc_info=True)
             error_occurred_flag = True
-            # ... (错误上报逻辑不变) ...
             if "行情服务用户验证失败" in err_msg or "登录失败" in err_msg or "密码错误" in err_msg or "auth fail" in err_msg.lower():
                 await self.sio.emit("task_error", {"task_id": task_id, "error": f"TQSDK认证/连接问题: {err_msg[:150]}"}, room=room_name)
             elif isinstance(e, ConnectionError):
                  await self.sio.emit("task_error", {"task_id": task_id, "error": f"网络连接错误: {err_msg[:150]}"}, room=room_name)
-            else: # 其他 TQSDK 内部错误或未知错误
+            else:
                 await self.sio.emit("task_error", {"task_id": task_id, "error": f"TQSDK启动时错误: {err_msg[:200]}"}, room=room_name)
         
         finally:
-            # ... (finally 块中的其余代码与上一版本相同，确保 tqapi_instance.close() 被调用) ...
+            # ... (finally 块中的清理逻辑与上一版本相同) ...
             logger.info(f"[任务 {task_id}] 进入 TQSDK 运行器的 finally 清理块...")
             if tqapi_instance:
                 try:
@@ -184,8 +185,9 @@ class TaskManager:
                 except Exception as db_err:
                     logger.error(f"[任务 {task_id}] 在尝试将任务状态更新为 ERROR 时发生数据库错误: {db_err}", exc_info=True)
 
+    # _emit_quote_update, _emit_account_update, start_task, stop_task, stop_all_tasks 方法保持不变
+    # ... (确保这些方法的代码与上一版本一致) ...
     async def _emit_quote_update(self, task_id: int, room_name: str, quote: Any, api: TqApi):
-        # ... (此方法与上一版本相同) ...
         rps = api.get_rps() if hasattr(api, 'get_rps') else None
         latency_ms = api.get_api_latency() if hasattr(api, 'get_api_latency') else None
         quote_data_to_send = {
@@ -200,7 +202,6 @@ class TaskManager:
         await self.sio.emit("quote_update", quote_data_to_send, room=room_name)
 
     async def _emit_account_update(self, task_id: int, room_name: str, account: TqAccount):
-        # ... (此方法与上一版本相同) ...
         account_data_to_send = {
             "task_id": task_id, "account_id": getattr(account, 'account_id', None),
             "broker_id": getattr(account, 'broker_id', None), "available": getattr(account, 'available', None),
@@ -213,7 +214,6 @@ class TaskManager:
 
 
     async def start_task(self, task_model: TradingTask) -> bool:
-        # ... (此方法与上一版本相同) ...
         task_id = task_model.id
         if task_id in self.active_asyncio_tasks:
             logger.warning(f"[任务 {task_id}] 尝试启动一个已在活动列表中的任务 (名称: '{task_model.name}')。")
@@ -266,7 +266,6 @@ class TaskManager:
         return True
 
     async def stop_task(self, task_id: int) -> bool:
-        # ... (此方法与上一版本相同) ...
         logger.info(f"[任务 {task_id}] 正在请求停止任务...")
         tq_runner_task_to_stop: Optional[asyncio.Task] = self.active_asyncio_tasks.get(task_id)
 
@@ -292,8 +291,8 @@ class TaskManager:
         else:
             logger.warning(f"[任务 {task_id}] 尝试停止一个当前不在活动列表中的任务。")
 
-        if task_id in self.active_tqapis:
-            logger.warning(f"[任务 {task_id}] (stop_task) 任务不在活动协程列表，但仍在 active_tqapis 中，现移除。")
+        if task_id in self.active_tqapis: # 确保在各种情况下都能清理 active_tqapis
+            logger.info(f"[任务 {task_id}] (stop_task) 尝试从 active_tqapis 中移除。")
             del self.active_tqapis[task_id]
 
 
@@ -321,7 +320,6 @@ class TaskManager:
         return True
     
     async def stop_all_tasks(self):
-        # ... (此方法与上一版本相同) ...
         logger.info("正在请求停止所有当前活动的 TQSDK 任务...")
         task_ids_to_stop = list(self.active_asyncio_tasks.keys())
         if not task_ids_to_stop:

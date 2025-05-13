@@ -6,7 +6,6 @@ logs
 *.bak
 *.swap
 *.swp
-*.txt
 result
 output
 crawler/model
