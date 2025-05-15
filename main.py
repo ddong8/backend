@@ -1,364 +1,405 @@
-# backend/main.py
-import asyncio 
-from contextlib import asynccontextmanager 
-from fastapi import FastAPI, Depends, HTTPException 
-from fastapi.middleware.cors import CORSMiddleware 
-import socketio 
-from sqlalchemy.ext.asyncio import AsyncSession 
-from sqlalchemy.future import select 
-from typing import Dict, List, Optional, Any, Callable 
-from datetime import datetime 
-import pydantic 
+import asyncio
+import enum  # 用于创建枚举类型
+import os
+import sys
+from contextlib import asynccontextmanager  # 导入异步上下文管理器
+from datetime import datetime, timezone  # 用于处理带时区的时间
+from typing import Any, AsyncGenerator, Dict  # AsyncGenerator 用于 lifespan
 
-from models import ( 
-    init_db, get_db, TradingTask, TaskStatus, AsyncSessionLocal 
-)
-from task_manager import TaskManager 
-from logging_config import setup_loguru 
-from config import TQ_ACCOUNT, TQ_PASSWORD 
+import socketio  # 用于 WebSocket 通信
+from dotenv import load_dotenv  # 用于从 .env 文件加载环境变量
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from loguru import logger
+from tqsdk import TqApi, TqAuth  # 天勤SDK核心组件
+from tqsdk.objs import Order  # 天勤SDK中的订单和行情对象
 
-from loguru import logger 
-setup_loguru() 
+# --- 全局变量与配置 ---
+load_dotenv() # 加载 .env 文件中的环境变量 (如果存在)
 
-class TaskBase(pydantic.BaseModel):
-    name: str = pydantic.Field(..., min_length=1, max_length=128, description="交易任务的自定义名称")
-    symbol: str = pydantic.Field(..., min_length=1, max_length=64, description="交易标的的合约代码")
+# 从环境变量或默认值获取天勤账户信息
+TQ_ACCOUNT = os.getenv("TQ_ACCOUNT", "你的天勤模拟账号")
+TQ_PASSWORD = os.getenv("TQ_PASSWORD", "你的天勤模拟密码")
 
-class TaskCreate(TaskBase):
-    pass
+# Loguru 日志配置
+logger.add(sys.stderr, level="INFO") # 添加一个新的标准错误输出，级别为 INFO
+logger.add("logs/trading_system_nod_db_{time}.log", rotation="1 day", retention="7 days", level="DEBUG") # 添加文件日志，每天轮换，保留7天，级别为 DEBUG
 
-class TaskResponse(TaskBase):
-    id: int
-    status: TaskStatus
-    created_at: datetime
-    updated_at: Optional[datetime] = None
-    model_config = pydantic.ConfigDict(from_attributes=True)
+# 内存中存储活动任务和API实例
+# active_trading_tasks: 键为任务ID (例如 "strategy_合约代码_目标手数"), 值为 asyncio.Task 对象
+active_trading_tasks: Dict[str, asyncio.Task] = {}
+# active_apis: 键为任务ID, 值为对应的 TqApi 实例
+active_apis: Dict[str, TqApi] = {}
 
-task_manager_instance: Optional[TaskManager] = None
 
-def get_async_session_factory() -> Callable[[], AsyncSession]:
-    return AsyncSessionLocal
-
+# --- 应用生命周期管理 (Lifespan) ---
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    global task_manager_instance
-    logger.info("FastAPI 应用正在启动...")
-    if not TQ_ACCOUNT or not TQ_PASSWORD:
-        logger.critical("严重警告: TQ_ACCOUNT 或 TQ_PASSWORD 环境变量未设置。")
-    await init_db()
-    task_manager_instance = TaskManager(
-        sio_server=sio, 
-        db_session_factory=get_async_session_factory()
-    )
-    logger.info("任务管理器已成功初始化。")
-    logger.info("正在尝试从数据库恢复上次运行时标记为 'RUNNING' 的任务...")
-    try:
-        async with get_async_session_factory()() as db:
-            stmt = select(TradingTask).where(TradingTask.status == TaskStatus.RUNNING)
-            result = await db.execute(stmt)
-            running_tasks_from_db: List[TradingTask] = result.scalars().all()
-            if running_tasks_from_db:
-                logger.info(f"发现 {len(running_tasks_from_db)} 个任务状态为 'RUNNING'。正在尝试重启...")
-                for task_model in running_tasks_from_db:
-                    logger.info(f"正在重新启动任务 ID: {task_model.id}, 名称: '{task_model.name}'")
-                    if task_manager_instance:
-                         await task_manager_instance.start_task(task_model)
-            else:
-                logger.info("数据库中未发现状态为 'RUNNING' 的任务需要恢复。")
-    except Exception as e:
-        logger.error(f"在尝试恢复运行中任务时发生错误: {e}", exc_info=True)
-    yield
-    logger.info("FastAPI 应用正在关闭...")
-    if task_manager_instance:
-        logger.info("正在请求任务管理器停止所有活动的交易任务...")
-        await task_manager_instance.stop_all_tasks()
-    logger.success("FastAPI 应用已成功关闭。所有资源已清理。")
+async def lifespan(app_instance: FastAPI) -> AsyncGenerator[None, None]:
+    """
+    FastAPI 应用的生命周期管理器。
+    在应用启动前执行 yield 之前的代码 (启动逻辑)。
+    在应用关闭后执行 yield 之后的代码 (关闭逻辑)。
+    """
+    # --- 启动逻辑 ---
+    logger.info("应用启动 (通过 lifespan)...")
+    logger.info(f"正在使用天勤账户: {TQ_ACCOUNT}")
+    # 如果需要，可以在这里初始化其他应用级资源
+    # 例如: app_instance.state.some_resource = await setup_resource()
 
-app = FastAPI(
-    title="智能交易平台后端 API",
-    description="提供交易任务管理、实时行情和账户数据推送等功能。",
-    version="0.2.1", # 版本更新
-    lifespan=lifespan
-)
+    yield  # 应用在此处运行
 
-sio = socketio.AsyncServer(
-    async_mode="asgi",
-    cors_allowed_origins="*",
-    logger=False, # Loguru 会处理应用日志，这里可以禁用 Socket.IO 自己的日志或设为 True 观察
-    engineio_logger=False, # 通常也禁用，除非深度调试 Engine.IO
-    ping_timeout=20,
-    ping_interval=25
-)
-socket_app = socketio.ASGIApp(sio,socketio_path="/") 
-app.mount("/ws", socket_app) 
+    # --- 关闭逻辑 ---
+    logger.info("应用关闭序列已启动 (通过 lifespan)...")
+    # 创建任务和API字典的副本进行迭代，因为在迭代过程中可能会删除项目
+    tasks_to_cancel = list(active_trading_tasks.items())
+    apis_to_close = list(active_apis.items())
 
+    # 取消所有活动的 asyncio 任务
+    for task_id, task in tasks_to_cancel:
+        if not task.done(): # 如果任务尚未完成
+            logger.info(f"正在取消任务 {task_id} (应用关闭)...")
+            task.cancel() # 请求取消任务
+            try:
+                # 等待任务实际完成取消，设置超时以防任务无法正常取消
+                await asyncio.wait_for(task, timeout=5.0)
+                logger.info(f"任务 {task_id} 已取消并完成。")
+            except asyncio.CancelledError:
+                logger.info(f"任务 {task_id} 成功取消 (符合预期)。")
+            except asyncio.TimeoutError:
+                logger.warning(f"任务 {task_id} 在关闭期间未能及时取消/完成。")
+            except Exception as e:
+                logger.error(f"关闭期间取消任务 {task_id} 时发生错误: {e}")
+        if task_id in active_trading_tasks: # 再次检查并移除，以防万一
+            del active_trading_tasks[task_id]
+
+    # 关闭所有活动的 TqApi 实例
+    for task_id, api in apis_to_close:
+        logger.info(f"正在关闭任务 {task_id} 的 TqApi 实例 (应用关闭)...")
+        try:
+            await api.close() # 关闭天勤API连接
+            logger.info(f"任务 {task_id} 的 TqApi 实例已关闭。")
+        except Exception as e:
+            logger.error(f"关闭期间关闭任务 {task_id} 的 TqApi 实例时发生错误: {e}")
+        if task_id in active_apis: # 再次检查并移除
+            del active_apis[task_id]
+
+    logger.info("所有活动的 TqApi 实例已关闭，任务已处理完毕 (应用关闭)。")
+    # 如果在启动时初始化了其他资源，在此处释放它们
+    # 例如: await app_instance.state.some_resource.close()
+
+
+# FastAPI 应用实例 - 使用 lifespan 进行生命周期管理
+app = FastAPI(title="最小化多任务交易系统 (无数据库, 使用 Lifespan)", lifespan=lifespan)
+
+# CORS (跨源资源共享) 中间件配置
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=True,
-    allow_methods=["*"],   
-    allow_headers=["*"],   
+    allow_origins=["*"],  # 允许所有来源 (生产环境应配置具体来源)
+    allow_credentials=True, # 允许携带凭证 (cookies, authorization headers)
+    allow_methods=["*"],  # 允许所有 HTTP 方法
+    allow_headers=["*"],  # 允许所有 HTTP 头部
 )
 
-@app.get("/", tags=["通用"], summary="API 健康检查及信息", response_description="API 状态信息")
-async def read_root():
-    logger.info("API 根路径被访问 (健康检查)。")
-    return {
-        "message": "欢迎使用智能交易平台后端 API!", "status": "运行中",
-        "version": app.version, "timestamp": datetime.utcnow().isoformat() + "Z"
+# Socket.IO 服务器实例
+sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*") # 异步模式, 允许所有来源的 CORS
+socket_app = socketio.ASGIApp(sio, app) # 将 Socket.IO 应用挂载到 FastAPI 应用上
+
+
+# --- 订单状态枚举 (内存中使用) ---
+class OrderStatus(enum.Enum):
+    PENDING = "PENDING"     # 待处理 (本地状态，尚未发送到交易所)
+    OPEN = "OPEN"           # 已报单 (已发送到交易所，等待撮合)
+    FILLED = "FILLED"       # 已成交
+    CANCELLED = "CANCELLED" # 已撤单
+    REJECTED = "REJECTED"   # 已拒绝 (交易所拒绝)
+    ERROR = "ERROR"         # 错误状态
+
+
+
+async def emit_trade_update(trade_details: Dict[str, Any]):
+    """通过 Socket.IO 发送交易/订单更新。参数为一个包含交易详情的字典。"""
+    await sio.emit("trade_update", trade_details) # 推送交易更新数据
+    # 同时记录一条日志
+    logger.warning(
+        f"交易更新: 任务 {trade_details.get('task_id')}, 合约 {trade_details.get('symbol')}, 状态 {trade_details.get('status')}",
+        task_id=trade_details.get('task_id')
+    )
+
+# --- 交易逻辑 (tqSDK) ---
+async def simple_trading_strategy(
+    api: TqApi,      # TqApi 实例
+    symbol: str,     # 交易合约代码, 例如 "SHFE.rb2410"
+    target_volume: int # 目标持仓手数 (正数为多头, 负数为空头 - 此处简化为只处理绝对值开仓)
+):
+    """
+    一个非常简单的交易策略示例：
+    为指定合约开仓到目标手数。
+    """
+    task_id = f"strategy_{symbol}_{target_volume}" # 为此策略任务生成唯一ID
+    logger.warning(f"启动交易策略: 合约 {symbol}, 目标手数 {target_volume}", task_id=task_id)
+
+    # 内存中表示当前交易/订单的详情
+    current_trade_details = {
+        "task_id": task_id,
+        "tq_order_id": None, # 天勤订单ID，下单后获取
+        "symbol": symbol,
+        "direction": "BUY" if target_volume > 0 else "SELL", # 根据目标手数决定买卖方向
+        "offset": "OPEN", # 简化处理：总是开仓
+        "volume": abs(target_volume), # 交易手数 (取绝对值)
+        "price": None, # 下单价格或最终成交价格
+        "status": OrderStatus.PENDING.value, # 初始状态为待处理
+        "created_at": datetime.now(timezone.utc).isoformat(), # 创建时间
+        "updated_at": datetime.now(timezone.utc).isoformat(), # 最后更新时间
+        "remark": f"目标持仓 {target_volume} 为合约 {symbol}" # 备注
     }
+    await emit_trade_update(current_trade_details.copy()) # 推送初始状态
 
-@app.post("/api/tasks", response_model=TaskResponse, status_code=201, tags=["任务管理"], summary="创建新交易任务")
-async def create_task_endpoint(task_data: TaskCreate, db: AsyncSession = Depends(get_db)):
-    logger.info(f"收到创建新任务的请求: 名称='{task_data.name}', 标的='{task_data.symbol}'")
-    db_task = TradingTask(name=task_data.name, symbol=task_data.symbol, status=TaskStatus.PENDING, created_at=datetime.utcnow(), updated_at=datetime.utcnow())
-    db.add(db_task)
     try:
-        await db.commit()  # 显式提交事务
-        await db.refresh(db_task)  # 显式刷新对象以获取数据库生成的 ID
-        logger.success(
-            f"交易任务已成功创建并持久化: ID={db_task.id}, 名称='{db_task.name}'"
+        quote = await api.get_quote(symbol) # 获取合约的最新行情
+        # 检查行情数据是否有效
+        if not quote or not hasattr(quote, 'last_price') or quote.last_price == float('nan'):
+            logger.warning(f"获取合约 {symbol} 的有效行情失败。", level="error", task_id=task_id)
+            current_trade_details.update({
+                "status": OrderStatus.REJECTED.value,
+                "remark": "获取行情失败",
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            })
+            await emit_trade_update(current_trade_details.copy())
+            return # 获取行情失败，策略终止
+
+        logger.warning(f"合约 {symbol} 当前行情: 最新价 {quote.last_price}", task_id=task_id)
+
+        direction = current_trade_details["direction"]
+        offset = current_trade_details["offset"]
+        volume_to_trade = current_trade_details["volume"]
+
+        # 确定下单价格 (简化：使用对手价，买入用卖一价，卖出用买一价)
+        order_price = quote.ask_price1 if direction == "BUY" else quote.bid_price1
+        # 如果对手价无效 (例如涨跌停封板，或值为0/inf)，则尝试使用最新价
+        if not order_price or order_price == float('inf') or order_price == float('-inf') or order_price == 0:
+            order_price = quote.last_price
+        # 如果最新价也无效，则无法下单
+        if not order_price or order_price == float('inf') or order_price == float('-inf') or order_price == 0:
+            logger.warning(f"无法为合约 {symbol} 确定有效的下单价格。行情: ask1={quote.ask_price1}, bid1={quote.bid_price1}, last={quote.last_price}", level="error", task_id=task_id)
+            current_trade_details.update({
+                "status": OrderStatus.REJECTED.value,
+                "remark": "无法确定有效的下单价格",
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            })
+            await emit_trade_update(current_trade_details.copy())
+            return
+
+        logger.warning(f"准备下单: {direction} {offset} 合约 {symbol}, 手数: {volume_to_trade}, 价格: {order_price}", task_id=task_id)
+        # 通过 TqApi 插入订单
+        order: Order = api.insert_order(
+            symbol=symbol,
+            direction=direction,
+            offset=offset,
+            volume=volume_to_trade,
+            limit_price=order_price # 限价单
         )
-    except Exception as e:
-        logger.error(
-            f"创建任务 (名称='{task_data.name}') 时数据库操作失败: {e}", exc_info=True
-        )
-        await db.rollback()  # 提交失败时回滚事务
-        raise HTTPException(status_code=500, detail=f"创建任务时发生数据库错误。")
+        # 更新内存中的订单详情
+        current_trade_details.update({
+            "tq_order_id": order.order_id, # 获取天勤订单ID
+            "price": order_price,          # 记录下单价格
+            "status": OrderStatus.OPEN.value, # 状态更新为已报单
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        })
+        await emit_trade_update(current_trade_details.copy()) # 推送更新
 
-    if db_task.id is None:  # 额外的健全性检查
-        logger.error(
-            f"严重错误：任务 (名称='{task_data.name}') commit 和 refresh 后 ID 仍然为 None！"
-        )
-        raise HTTPException(status_code=500, detail="创建任务后未能获取任务 ID。")
-    return db_task  # FastAPI 会自动将 ORM 对象序列化为 TaskResponse 模型
+        # 循环等待订单状态变化，直到订单出错或进入最终状态 (is_dead)
+        # 同时检查 api.is_running() 确保在API关闭时能正确退出循环
+        while api.is_running() and not order.is_error and not order.is_dead:
+            api.wait_update() # 等待TqSDK推送更新
+            # 检查订单的关键字段是否有变化
+            if api.is_changing(order, ["status", "volume_orign", "volume_left", "last_msg", "trade_price"]):
+                logger.warning(f"订单 {order.order_id} 状态: {order.status}, 已成交/总手数: {order.volume_traded}/{order.volume_orign}, 信息: {order.last_msg}", task_id=task_id)
+                new_status_str = current_trade_details["status"] # 当前状态字符串
+                # 根据天勤的订单状态更新本地状态
+                if order.status == "AL成交" or order.status == "FINISHED": # FINISHED 是天勤内部C++接口的状态
+                    new_status_str = OrderStatus.FILLED.value
+                    current_trade_details["price"] = order.trade_price or order_price # 更新为实际成交价
+                    current_trade_details["remark"] = f"以价格 {current_trade_details['price']} 成交"
+                elif order.status == "CANCELLED" or order.status == "已撤单":
+                    new_status_str = OrderStatus.CANCELLED.value
+                elif order.status == "REJECTED" or order.status == "已拒绝":
+                    new_status_str = OrderStatus.REJECTED.value
+                # 可以根据需要映射其他天勤订单状态
 
-@app.get("/api/tasks", response_model=List[TaskResponse], tags=["任务管理"], summary="获取所有交易任务列表")
-async def get_tasks_endpoint(skip: int = 0, limit: int = 100, db: AsyncSession = Depends(get_db)):
-    logger.info(f"收到获取任务列表的请求: skip={skip}, limit={limit}")
-    stmt = select(TradingTask).order_by(TradingTask.id.desc()).offset(skip).limit(limit)
-    result = await db.execute(stmt)
-    tasks: List[TradingTask] = result.scalars().all()
-    logger.info(f"成功获取 {len(tasks)} 个任务。")
-    return tasks
+                # 如果状态发生变化，则更新并推送
+                if new_status_str != current_trade_details["status"]:
+                    current_trade_details["status"] = new_status_str
+                current_trade_details["updated_at"] = datetime.now(timezone.utc).isoformat()
+                await emit_trade_update(current_trade_details.copy())
 
-@app.get("/api/tasks/{task_id}", response_model=TaskResponse, tags=["任务管理"], summary="获取特定交易任务详情")
-async def get_task_endpoint(task_id: int, db: AsyncSession = Depends(get_db)):
-    logger.info(f"收到获取任务详情的请求: 任务 ID={task_id}")
-    db_task: Optional[TradingTask] = await db.get(TradingTask, task_id)
-    if db_task is None:
-        logger.warning(f"尝试获取任务失败：未找到 ID 为 {task_id} 的任务。")
-        raise HTTPException(status_code=404, detail=f"未找到 ID 为 {task_id} 的任务。")
-    logger.info(f"成功获取任务详情: ID={db_task.id}, 名称='{db_task.name}'")
-    return db_task
+        # 订单循环结束后处理最终状态
+        if order.is_error: # 如果订单出错
+            logger.warning(f"订单 {order.order_id} 发生错误: {order.last_msg}", level="error", task_id=task_id)
+            current_trade_details.update({
+                "status": OrderStatus.ERROR.value,
+                "remark": order.last_msg or "未知的订单错误",
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            })
+            await emit_trade_update(current_trade_details.copy())
+        elif order.is_dead: # 如果订单进入最终状态 (非错误)
+             logger.warning(f"订单 {order.order_id} 处理完成。最终状态: {order.status}", task_id=task_id)
+             # 再次确认最终状态，以防循环中未能正确设置 (例如，直接进入 FINISHED 但未触发 is_changing)
+             final_status_map = {
+                 "AL成交": OrderStatus.FILLED.value, "FINISHED": OrderStatus.FILLED.value,
+                 "CANCELLED": OrderStatus.CANCELLED.value, "已撤单": OrderStatus.CANCELLED.value,
+                 "REJECTED": OrderStatus.REJECTED.value, "已拒绝": OrderStatus.REJECTED.value,
+             }
+             final_status = final_status_map.get(order.status, current_trade_details["status"]) # 如果状态不在map中，保持原样
+             # 如果状态有变，或者之前是OPEN状态但现在已结束，则更新
+             if final_status != current_trade_details["status"] or current_trade_details["status"] == OrderStatus.OPEN.value:
+                current_trade_details["status"] = final_status
+                if final_status == OrderStatus.FILLED.value: # 如果是成交，确保价格和备注正确
+                    current_trade_details["price"] = order.trade_price or current_trade_details["price"]
+                    current_trade_details["remark"] = f"以价格 {current_trade_details['price']} 成交"
+                current_trade_details["updated_at"] = datetime.now(timezone.utc).isoformat()
+                await emit_trade_update(current_trade_details.copy())
 
-@app.post("/api/tasks/{task_id}/start", response_model=TaskResponse, tags=["任务管理"], summary="启动一个指定的交易任务")
-async def start_task_endpoint(task_id: int, db: AsyncSession = Depends(get_db)):
-    logger.info(f"收到启动任务的请求: 任务 ID={task_id}")
-    if task_manager_instance is None:
-        logger.critical("任务管理器未初始化，无法启动任务。")
-        raise HTTPException(status_code=503, detail="服务内部错误：任务管理器当前不可用。")
-    
-    db_task: Optional[TradingTask] = await db.get(TradingTask, task_id)
-    if db_task is None:
-        logger.warning(f"启动任务失败：未找到 ID 为 {task_id} 的任务。")
-        raise HTTPException(status_code=404, detail=f"未找到 ID 为 {task_id} 的任务以启动。")
-    
-    if db_task.status == TaskStatus.RUNNING:
-        logger.warning(f"启动任务请求被拒绝：任务 ID={task_id} (名称='{db_task.name}') 已运行。")
-        raise HTTPException(status_code=400, detail="任务当前已在运行中。")
-    
-    if db_task.status == TaskStatus.ERROR:
-        logger.info(f"尝试启动处于 ERROR 状态的任务 ID: {task_id}。允许启动。")
+    except asyncio.CancelledError: # 捕获任务被取消的异常
+        logger.warning(f"策略任务 {task_id} (合约 {symbol}) 被取消。", level="warning", task_id=task_id)
+        current_trade_details.update({
+            "status": OrderStatus.CANCELLED.value, # 可以定义一个特定的“策略取消”状态
+            "remark": "策略任务被取消",
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        })
+        await emit_trade_update(current_trade_details.copy())
+        raise # 重新抛出 CancelledError，以便上层任务管理逻辑能感知到
+    except Exception as e: # 捕获其他所有异常
+        logger.exception(f"交易策略 {symbol} 执行时发生未捕获的错误: {e}") # 使用 logger.exception 记录完整堆栈跟踪
+        logger.warning(f"策略执行异常 ({symbol}): {e}", level="error", task_id=task_id)
+        current_trade_details.update({
+            "status": OrderStatus.ERROR.value,
+            "remark": str(e),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        })
+        await emit_trade_update(current_trade_details.copy())
+    finally:
+        logger.warning(f"交易策略 {symbol} 执行完毕或退出。", task_id=task_id)
+        # active_trading_tasks 和 active_apis 的清理由API端点和lifespan的关闭逻辑管理
 
-    success = await task_manager_instance.start_task(db_task)
-    if not success:
-        logger.error(f"任务管理器未能成功启动任务 ID={task_id}。")
-        # 具体的错误原因应该由 task_manager.start_task 记录
-        # 这里可以返回一个通用的 500 错误，或更具体的错误（如果 task_manager 返回了错误信息）
-        raise HTTPException(status_code=500, detail="启动任务时发生内部错误。请检查服务器日志。")
-    
-    # 再次从数据库获取任务，以确保返回的是最新的状态
-    # (因为 start_task 内部会修改数据库并通过其自己的会话提交)
-    updated_db_task: Optional[TradingTask] = await db.get(TradingTask, task_id)
-    if not updated_db_task: # 理论上不应发生
-        logger.error(f"启动任务后无法从数据库重新获取任务 ID={task_id}。")
-        raise HTTPException(status_code=500, detail="启动任务后状态同步失败。")
-
-    logger.success(f"交易任务已成功启动: ID={updated_db_task.id}, 名称='{updated_db_task.name}', 新状态: {updated_db_task.status.value}")
-    return updated_db_task
-
-@app.post("/api/tasks/{task_id}/stop", response_model=TaskResponse, tags=["任务管理"], summary="停止一个指定的交易任务")
-async def stop_task_endpoint(task_id: int, db: AsyncSession = Depends(get_db)):
-    logger.info(f"收到停止任务的请求: 任务 ID={task_id}")
-    if task_manager_instance is None:
-        logger.critical("任务管理器未初始化，无法停止任务。")
-        raise HTTPException(status_code=503, detail="服务内部错误：任务管理器当前不可用。")
-
-    db_task_before_stop: Optional[TradingTask] = await db.get(TradingTask, task_id)
-    if db_task_before_stop is None:
-        logger.warning(f"停止任务失败：未找到 ID 为 {task_id} 的任务。")
-        raise HTTPException(status_code=404, detail=f"未找到 ID 为 {task_id} 的任务以停止。")
-    
-    is_in_manager = task_id in (task_manager_instance.active_asyncio_tasks if task_manager_instance else {})
-    if db_task_before_stop.status not in [TaskStatus.RUNNING, TaskStatus.ERROR] and not is_in_manager:
-         logger.warning(f"停止任务请求：任务 ID={task_id} 状态为 '{db_task_before_stop.status.value}' 且不在活动列表，无需停止。")
-         return db_task_before_stop 
-
-    success = await task_manager_instance.stop_task(task_id)
-    # stop_task 内部会更新数据库状态
-    
-    updated_db_task: Optional[TradingTask] = await db.get(TradingTask, task_id)
-    if not updated_db_task: # 理论上不应发生
-        logger.error(f"停止任务后无法从数据库重新获取任务 ID={task_id}。")
-        # 即使找不到，也认为停止操作在 TaskManager层面可能已成功
-        # 返回一个表示任务可能已被删除或出错的状态
-        # 或者，如果 success 为 True，但找不到 db_task，这表示一个严重的不一致
-        if success:
-            raise HTTPException(status_code=500, detail="停止任务后状态同步失败，数据库记录可能丢失。")
-        else: # 如果 stop_task 本身返回 False
-            raise HTTPException(status_code=500, detail="停止任务操作失败，请检查服务器日志。")
-
-
-    logger.info(f"交易任务停止请求已处理: ID={updated_db_task.id}, 名称='{updated_db_task.name}', 当前状态: {updated_db_task.status.value}")
-    return updated_db_task
-
-# -------- Socket.IO 事件处理器 (与上一版本基本一致，确保 task_manager_instance.active_tqapis 存在) --------
-@sio.event
-async def connect(sid: str, environ: dict, auth: Optional[dict] = None):
-    remote_addr = environ.get('asgi.scope', {}).get('client', ('N/A', None))[0]
-    logger.info(f"Socket.IO 客户端已连接: SID='{sid}', IP='{remote_addr}', Auth: {auth if auth else '无'}")
-    await sio.emit("welcome", {"message": "已成功连接到智能交易平台实时数据服务！"}, room=sid)
-
-@sio.event
-async def disconnect(sid: str):
-    logger.info(f"Socket.IO 客户端已断开连接: SID='{sid}'")
-
-@sio.event
-async def join_task_room(
-    sid: str, data: Any, ack: Optional[Callable] = None
-) -> Optional[Dict[str, Any]]:  # 添加可选的 ack 参数，并调整返回类型
+# --- FastAPI HTTP API 端点 ---
+@app.post("/trade/start_strategy/{symbol}")
+async def start_trading_strategy_endpoint(
+    symbol: str,      # 路径参数：合约代码
+    target_volume: int, # 查询参数：目标手数
+):
     """
-    处理客户端加入特定任务房间的请求。
-    客户端应发送包含 "task_id" 的数据。
-    成功加入后，该客户端将能接收到对应任务的实时数据推送。
-    如果提供了 ack 回调，则调用它。
+    启动一个简单的交易策略任务。
+    为每个策略任务创建一个新的 TqApi 实例。
     """
-    logger.debug(
-        f"SID='{sid}' 请求加入任务房间，数据: {data}, 是否有 ack: {ack is not None}"
-    )
-    response_message: Dict[str, Any]
-
-    if not isinstance(data, dict) or "task_id" not in data:
-        msg = "请求数据格式错误，必须包含 'task_id'。"
-        logger.warning(
-            f"来自 SID='{sid}' 的 'join_task_room' 请求格式错误：{msg} 数据: {data}"
-        )
-        response_message = {"status": "error", "message": msg}
-        if ack:
-            await ack(response_message)  # 如果有 ack，调用它
-        return None  # 或者直接返回，FastAPI/SocketIO 会处理
-
-    task_id_data = data.get("task_id")
-    if not isinstance(task_id_data, int):
-        msg = "'task_id' 必须是一个整数。"
-        logger.warning(
-            f"来自 SID='{sid}' 的 'join_task_room' 请求 'task_id' 类型无效: {task_id_data} (类型: {type(task_id_data).__name__})"
-        )
-        response_message = {"status": "error", "message": msg}
-        if ack:
-            await ack(response_message)
-        return None
-
-    task_id: int = task_id_data
-    room_name: str = f"task_{task_id}"
+    task_id = f"strategy_{symbol}_{target_volume}"
+    # 检查是否已有同名任务在运行
+    if task_id in active_trading_tasks and not active_trading_tasks[task_id].done():
+        raise HTTPException(status_code=400, detail=f"交易任务 {task_id} 已在运行。")
 
     try:
-        await sio.enter_room(sid, room_name)
-        logger.info(f"客户端 SID='{sid}' 已成功加入 Socket.IO 房间: '{room_name}'")
+        
+        # 创建 TqApi 实例，不启动 web_gui
+        api = TqApi(auth=TqAuth(user_name=TQ_ACCOUNT, password=TQ_PASSWORD))
+        active_apis[task_id] = api # 存储 API 实例
 
-        # (可选) 推送初始行情
-        if task_manager_instance and task_id in task_manager_instance.active_tqapis:
-            # ... (推送初始行情的逻辑) ...
-            pass  # 省略以保持简洁，之前的代码是正确的
-
-        msg = f"已成功加入房间 '{room_name}'。"
-        response_message = {"status": "success", "message": msg}
-        if ack:
-            await ack(response_message)
-        return None  # 如果已经调用 ack，通常不需要再返回 HTTP 响应式的内容
-        # 如果不调用 ack，可以返回字典，Socket.IO 会将其作为 ack 的数据
-    except Exception as e:
-        msg = "加入房间时发生服务器内部错误。"
-        logger.error(
-            f"客户端 SID='{sid}' 加入房间 '{room_name}' 时发生错误: {e}", exc_info=True
+        # 创建并启动异步策略任务
+        strategy_task = asyncio.create_task(
+            simple_trading_strategy(api, symbol, target_volume)
         )
-        response_message = {"status": "error", "message": msg}
-        if ack:
-            await ack(response_message)
-        return None
+        active_trading_tasks[task_id] = strategy_task # 存储任务实例
 
+        logger.warning(f"交易策略任务 {task_id} (合约 {symbol}) 已创建。", task_id=task_id)
+        return {"message": "交易策略已启动。", "task_id": task_id, "symbol": symbol, "target_volume": target_volume}
+
+    except Exception as e: # 启动过程中的任何异常
+        logger.error(f"启动交易策略 {symbol} 失败: {e}")
+        # 如果 API 实例已创建但任务启动失败，尝试关闭 API
+        if task_id in active_apis:
+            try:
+                await active_apis[task_id].close()
+            except Exception as api_close_err:
+                logger.error(f"关闭失败任务 {task_id} 的 API 时出错: {api_close_err}")
+            del active_apis[task_id]
+        raise HTTPException(status_code=500, detail=f"启动策略失败: {str(e)}")
+
+@app.post("/trade/stop_strategy/{task_id}")
+async def stop_trading_strategy_endpoint(task_id: str): # 路径参数：任务ID
+    """停止指定的交易策略任务。"""
+    if task_id not in active_trading_tasks:
+        raise HTTPException(status_code=404, detail=f"任务 {task_id} 未找到。")
+
+    task = active_trading_tasks[task_id]
+    api_instance = active_apis.get(task_id) # 获取对应的 API 实例
+
+    if not task.done(): # 如果任务尚未完成
+        task.cancel() # 请求取消任务
+        logger.warning(f"已请求取消交易任务 {task_id}。", task_id=task_id)
+        try:
+            await task # 等待任务实际完成或被取消
+        except asyncio.CancelledError:
+            logger.warning(f"交易任务 {task_id} 成功取消。", task_id=task_id)
+        except Exception as e: # 捕获任务在取消过程中可能抛出的其他异常
+            logger.warning(f"任务 {task_id} (取消请求后)发生异常: {e}", level="error", task_id=task_id)
+
+    # 关闭与此任务关联的 TqApi 实例
+    if api_instance:
+        try:
+            await api_instance.close()
+            logger.warning(f"任务 {task_id} 的 TqApi 实例已关闭。", task_id=task_id)
+        except Exception as e:
+            logger.warning(f"关闭任务 {task_id} 的 TqApi 实例时出错: {e}", level="error", task_id=task_id)
+        if task_id in active_apis: # 从字典中移除
+            del active_apis[task_id]
+
+    if task_id in active_trading_tasks: # 从字典中移除任务记录
+         del active_trading_tasks[task_id]
+
+    return {"message": f"交易任务 {task_id} 已停止 (或已处理取消请求)。"}
+
+@app.get("/tasks/status")
+async def get_tasks_status():
+    """获取所有活动交易任务的状态。"""
+    statuses = {}
+    for task_id, task in active_trading_tasks.items():
+        status_info = {
+            "done": task.done(), # 任务是否已完成
+            "cancelled": task.cancelled(), # 任务是否被取消
+        }
+        # 如果任务已完成且未被取消，检查是否有未处理的异常
+        if task.done() and not task.cancelled():
+            try:
+                task.result() # 如果任务有异常，调用 result() 会重新抛出它
+                status_info["exception"] = None
+            except Exception as e:
+                status_info["exception"] = str(e)
+        else:
+            status_info["exception"] = None # 对于未完成或已取消的任务，不检查异常
+        statuses[task_id] = status_info
+    return statuses
+
+# --- Socket.IO 事件处理器 ---
+@sio.event
+async def connect(sid, environ): # 当客户端连接时触发
+    """处理新的 Socket.IO 客户端连接。"""
+    logger.warning(f"客户端已连接: {sid}")
+    # 可以向新连接的客户端发送一些初始状态信息
+    # await sio.emit('initial_data', {'message': '欢迎!'}, room=sid)
 
 @sio.event
-async def leave_task_room(
-    sid: str, data: Any, ack: Optional[Callable] = None
-) -> Optional[Dict[str, Any]]:
-    """处理客户端离开特定任务房间的请求。"""
-    logger.debug(
-        f"SID='{sid}' 请求离开任务房间，数据: {data}, 是否有 ack: {ack is not None}"
-    )
-    response_message: Dict[str, Any]
+async def disconnect(sid): # 当客户端断开连接时触发
+    """处理 Socket.IO 客户端断开连接。"""
+    logger.warning(f"客户端已断开: {sid}")
 
-    if not isinstance(data, dict) or "task_id" not in data:
-        msg = "请求数据格式错误，必须包含 'task_id'。"
-        logger.warning(
-            f"来自 SID='{sid}' 的 'leave_task_room' 请求格式错误：{msg} 数据: {data}"
-        )
-        response_message = {"status": "error", "message": msg}
-        if ack:
-            await ack(response_message)
-        return None
+# (可以添加更多 @sio.event 来处理来自客户端的消息)
+# @sio.event
+# async def client_message(sid, data):
+#     await emit_log(f"收到来自客户端 {sid} 的消息: {data}")
+#     await sio.emit('server_response', {'received': data}, room=sid)
 
-    task_id_data = data.get("task_id")
-    if not isinstance(task_id_data, int):
-        msg = "'task_id' 必须是一个整数。"
-        logger.warning(
-            f"来自 SID='{sid}' 的 'leave_task_room' 请求 'task_id' 类型无效: {task_id_data}"
-        )
-        response_message = {"status": "error", "message": msg}
-        if ack:
-            await ack(response_message)
-        return None
 
-    task_id: int = task_id_data
-    room_name: str = f"task_{task_id}"
-
-    try:
-        await sio.leave_room(sid, room_name)
-        logger.info(f"客户端 SID='{sid}' 已成功离开 Socket.IO 房间: '{room_name}'")
-        msg = f"已成功离开房间 '{room_name}'。"
-        response_message = {"status": "success", "message": msg}
-        if ack:
-            await ack(response_message)
-        return None
-    except Exception as e:
-        msg = "离开房间时发生服务器内部错误。"
-        logger.error(
-            f"客户端 SID='{sid}' 离开房间 '{room_name}' 时发生错误: {e}", exc_info=True
-        )
-        response_message = {"status": "error", "message": msg}
-        if ack:
-            await ack(response_message)
-        return None
-
-# -------- Uvicorn 启动 (用于直接运行此文件进行本地开发测试) --------
+# --- Uvicorn 服务器运行入口 ---
 if __name__ == "__main__":
     import uvicorn
-    logger.info("正在以开发模式启动 Uvicorn ASGI 服务器 (用于直接运行 backend/main.py)...")
-    uvicorn.run(
-        "main:app", # 指向 FastAPI 应用实例
-        host="0.0.0.0", 
-        port=8000, 
-        reload=False, # 启用代码热重载 (开发时方便)
-        log_level="debug", # Uvicorn 自身的日志级别
-    )
+    logger.info("正在启动 Uvicorn 服务器...")
+    # 使用字符串 "main:socket_app" 以便 uvicorn 的 --reload 功能可以正常工作
+    uvicorn.run("main:socket_app", host="0.0.0.0", port=8000, log_level="info", reload=False)
