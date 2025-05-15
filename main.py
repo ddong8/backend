@@ -344,7 +344,7 @@ async def stop_trading_strategy_endpoint(task_id: str): # 路径参数：任务I
     # 关闭与此任务关联的 TqApi 实例
     if api_instance:
         try:
-            await api_instance.close()
+            api_instance.close()
             logger.warning(f"任务 {task_id} 的 TqApi 实例已关闭。", task_id=task_id)
         except Exception as e:
             logger.warning(f"关闭任务 {task_id} 的 TqApi 实例时出错: {e}", level="error", task_id=task_id)
