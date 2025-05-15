@@ -155,7 +155,7 @@ async def simple_trading_strategy(
     await emit_trade_update(current_trade_details.copy()) # 推送初始状态
 
     try:
-        quote = await api.get_quote(symbol) # 获取合约的最新行情
+        quote = api.get_quote(symbol) # 获取合约的最新行情
         # 检查行情数据是否有效
         if not quote or not hasattr(quote, 'last_price') or quote.last_price == float('nan'):
             logger.warning(f"获取合约 {symbol} 的有效行情失败。", level="error", task_id=task_id)
@@ -209,11 +209,11 @@ async def simple_trading_strategy(
 
         # 循环等待订单状态变化，直到订单出错或进入最终状态 (is_dead)
         # 同时检查 api.is_running() 确保在API关闭时能正确退出循环
-        while api.is_running() and not order.is_error and not order.is_dead:
+        while not order.is_error and not order.is_dead:
             api.wait_update() # 等待TqSDK推送更新
             # 检查订单的关键字段是否有变化
             if api.is_changing(order, ["status", "volume_orign", "volume_left", "last_msg", "trade_price"]):
-                logger.warning(f"订单 {order.order_id} 状态: {order.status}, 已成交/总手数: {order.volume_traded}/{order.volume_orign}, 信息: {order.last_msg}", task_id=task_id)
+                logger.warning(f"订单 {order.order_id} 状态: {order.status}, 已成交/总手数: {order.volume_left}/{order.volume_orign}, 信息: {order.last_msg}", task_id=task_id)
                 new_status_str = current_trade_details["status"] # 当前状态字符串
                 # 根据天勤的订单状态更新本地状态
                 if order.status == "AL成交" or order.status == "FINISHED": # FINISHED 是天勤内部C++接口的状态
