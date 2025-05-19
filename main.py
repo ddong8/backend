@@ -2,6 +2,7 @@ import asyncio
 import enum
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, List, Optional
@@ -175,7 +176,7 @@ async def run_task_logic_for_frontend(
         )
 
         while True:
-            api.wait_update()
+            api.wait_update(deadline=time.time() + 0.001)
             await emit_quote_update_for_frontend(task_id, quote, symbol)
             await emit_account_update_for_frontend(task_id, account)
             await asyncio.sleep(0.5)
@@ -347,8 +348,6 @@ async def leave_task_room(sid: str, data: Any, ack: any) -> Dict[str, Any]:
     logger.info(f"Socket.IO 客户端 {sid} 离开任务房间 task_{task_id}")
     return {"status": "ok", "message": f"离开任务 {task_id} 房间成功"}
 
-
-# 如果需要，将 _handle_join 和 _handle_leave 实现粘贴于此
 
 if __name__ == "__main__":
     import uvicorn
