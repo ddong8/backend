@@ -10,3 +10,4 @@ result
 output
 crawler/model
 /venv
+*.env
